@@ -219,7 +219,11 @@ def complaints_lookup(es, text: str, borough: str | None = None) -> dict:
              "count_30d": 0, "by_borough": [], "top_resolutions": [],
              "period_start": PERIOD_START, "period_end": PERIOD_END}
     if not hits:
-        return empty
+        return {**empty, "no_match": True, "match_score": 0.0}
+    # Floor 0.80: real matches score 0.82-0.88; junk scored 0.815-0.838, so this only drops gibberish.
+    if hits[0]["_score"] < 0.80:
+        return {**empty, "no_match": True, "match_score": round(hits[0]["_score"], 3)}
+    empty["match_score"] = round(hits[0]["_score"], 3)
     top = hits[0]["_source"]
     # Near-ties (labels differ by a word, e.g. "Noise - Park" vs "Noise - Residential"):
     # among types scoring within TIE_MARGIN of the best, pick the most-reported one citywide.

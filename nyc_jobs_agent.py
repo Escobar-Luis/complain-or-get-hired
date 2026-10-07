@@ -131,6 +131,8 @@ General rules:
 - Never invent a posting, count, agency, salary or pay figure. Only use what the tools returned. If a tool returned nothing or an error, say so plainly.
 - Plain English. No markdown tables. Keep it short.
 
+If complaints_lookup returns no_match, do not search jobs; answer in one line that no 311 complaint type matched and ask for one concrete detail, e.g. what is broken and where.
+
 A) When the user describes a problem in the city (rats, noise, potholes, a broken streetlight, heat, trash...), follow this order:
   1. complaints_lookup(text, borough if they named a place; map neighborhoods to their borough, e.g. Astoria -> QUEENS). Call it exactly once.
   2. search_jobs with agency = the lookup's jobs_agency (exact string) and a query describing the work that fixes the complaint (e.g. "pest control inspector rodent exterminator"). If that returns zero postings, call search_jobs again with no agency filter.
@@ -298,6 +300,32 @@ def _result_line(name: str, result) -> str:
     return "<- done"
 
 
+OTHER_REPLY = "Tell me something broken in the city, like rats or a dark streetlight, and I will find the job that fixes it."
+GATE_SYSTEM = ("Label the text. complaint = something wrong in New York City a city agency could fix. "
+               "job_question = asking about NYC government jobs, pay or hiring. "
+               "other = anything else, including greetings and unrelated statements.")
+
+
+def _gate(client, text: str, verbose: bool) -> str | None:
+    """Label the text with mistral-small. Returns 'complaint', 'job_question', 'other', or None on error."""
+    try:
+        from typing import Literal
+        from pydantic import BaseModel
+
+        class Intent(BaseModel):
+            kind: Literal["complaint", "job_question", "other"]
+
+        resp = client.chat.parse(model=FALLBACK_MODEL, response_format=Intent,
+                                 messages=[{"role": "system", "content": GATE_SYSTEM},
+                                           {"role": "user", "content": text}])
+        kind = resp.choices[0].message.parsed.kind
+    except Exception:
+        return None  # gate failed: skip it
+    if verbose:
+        print(f"-> Mistral gate: {kind}")
+    return kind
+
+
 def _converse(messages: list, es, client, model: str, verbose: bool) -> str:
     """Run the tool loop on an existing message list (mutated in place). Returns the answer."""
     state = {"model": model, "fell_back": False}
@@ -373,6 +401,10 @@ def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose
         return "Type a question inside ask(\"...\")."
     es = es or es_client()
     client = client or _client()
+    if _gate(client, question, verbose) == "other":
+        if verbose:
+            print(f"\n{OTHER_REPLY}")
+        return OTHER_REPLY
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
@@ -396,6 +428,9 @@ def chat(es=None, client=None, model: str = DEFAULT_MODEL, verbose: bool = True)
             continue
         if q.lower() in ("quit", "exit", "q"):
             break
+        if _gate(client, q, verbose) == "other":
+            print(f"\n{OTHER_REPLY}\n")
+            continue
         mark = len(messages)
         messages.append({"role": "user", "content": q})
         try:
