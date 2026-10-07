@@ -23,6 +23,7 @@ from nyc_jobs_ingest import INDEX, es_client
 DEFAULT_MODEL = "mistral-large-4"
 FALLBACK_MODEL = "mistral-small-latest"
 MAX_TOOL_ROUNDS = 5
+MAX_TOOL_CALLS = 5
 
 RETURN_FIELDS = [
     "job_id", "business_title", "agency", "salary_range_from", "salary_range_to",
@@ -131,7 +132,7 @@ General rules:
 - Plain English. No markdown tables. Keep it short.
 
 A) When the user describes a problem in the city (rats, noise, potholes, a broken streetlight, heat, trash...), follow this order:
-  1. complaints_lookup(text, borough if they named a place; map neighborhoods to their borough, e.g. Astoria -> QUEENS). Call it once; never repeat a tool call with the same arguments.
+  1. complaints_lookup(text, borough if they named a place; map neighborhoods to their borough, e.g. Astoria -> QUEENS). Call it exactly once.
   2. search_jobs with agency = the lookup's jobs_agency (exact string) and a query describing the work that fixes the complaint (e.g. "pest control inspector rodent exterminator"). If that returns zero postings, call search_jobs again with no agency filter.
   3. real_pay with the chosen posting's civil_service_title (and its agency).
   4. Answer with these sections, each a short line or two, in this order, each heading in bold:
@@ -151,7 +152,12 @@ B) For ordinary job questions, behave as a job search assistant:
 - If the data cannot answer part of the question, say that part is not in the data.
 - Answer with a short list of jobs or numbers, then one line of advice at most.
 
-Make at most 5 tool calls in total, then answer."""
+Tool call caps (hard limits):
+- Exactly one complaints_lookup per complaint.
+- At most two search_jobs. The second only if the first returned zero postings.
+- At most two real_pay. The second only if the first returned matched_how "none"; then try the posting's civil_service_title words without agency.
+- At most 5 tool calls in total, then answer.
+Each answer section is one or two lines. In "Real pay in that title", if real_pay returned a pay_basis field, state it (e.g. per hour, per annum)."""
 
 TOOLS = [
     {
@@ -245,18 +251,51 @@ def _should_fall_back(err: Exception) -> bool:
     return status in (400, 404, 429) or "model" in text or "rate" in text or "capacity" in text
 
 
-def _summary(name: str, result) -> str:
-    if isinstance(result, list):
-        return f"{len(result)} postings"
-    if not isinstance(result, dict):
-        return str(result)[:80]
-    if "error" in result:
-        return f"error: {result['error']}"
+def _cut(t, n: int = 60) -> str:
+    t = " ".join(str(t or "").split())
+    return t if len(t) <= n else t[: n - 3] + "..."
+
+
+def _money(v) -> str:
+    try:
+        return f"${float(v):,.0f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _call_line(name: str, args: dict) -> str:
     if name == "complaints_lookup":
-        return f"{result.get('complaint_type')}: {result.get('count_30d')} complaints, agency {result.get('agency')}"
+        b = f" ({args['borough']})" if args.get("borough") else ""
+        return f'-> Elastic 311: "{_cut(args.get("text"))}"{b}'
+    if name == "search_jobs":
+        a = f"agency {args['agency']}, " if args.get("agency") else ""
+        return f'-> Elastic jobs: {a}"{_cut(args.get("query"))}"'
     if name == "real_pay":
-        return f"{result.get('title')}: headcount {result.get('headcount')}, avg base {result.get('avg_base')}"
-    return str(result.get("total", ""))
+        return f"-> Elastic payroll: {_cut(args.get('title'))}"
+    if name == "count_jobs":
+        q = f' "{_cut(args.get("query"))}"' if args.get("query") else ""
+        return f"-> Elastic count:{q}"
+    return f"-> Elastic {name}"
+
+
+def _result_line(name: str, result) -> str:
+    if isinstance(result, dict) and "error" in result:
+        return f"<- error: {_cut(result['error'])}"
+    if name == "complaints_lookup":
+        return f"<- {result.get('complaint_type')}, {result.get('count_30d')} complaints, owner {result.get('agency')}"
+    if name == "search_jobs":
+        if not result:
+            return "<- 0 postings"
+        return f"<- {len(result)} postings, top: {_cut(result[0].get('business_title'))}"
+    if name == "real_pay":
+        if not result.get("headcount") or result.get("matched_how") == "none":
+            return "<- no match"
+        basis = f" ({result['pay_basis']})" if result.get("pay_basis") else ""
+        return (f"<- {result.get('headcount')} people, base {_money(result.get('avg_base'))}, "
+                f"OT {_money(result.get('avg_overtime'))}{basis}")
+    if name == "count_jobs":
+        return f"<- {result.get('total')} postings"
+    return "<- done"
 
 
 def _converse(messages: list, es, client, model: str, verbose: bool) -> str:
@@ -278,9 +317,8 @@ def _converse(messages: list, es, client, model: str, verbose: bool) -> str:
             state["model"], state["fell_back"] = FALLBACK_MODEL, True
             return _chat(**kw)
 
-    if verbose:
-        print(f"[model] {model}")
-
+    cache: dict = {}
+    n_calls = 0
     for round_no in range(1, MAX_TOOL_ROUNDS + 1):
         # First round must use a tool; later rounds may answer.
         resp = complete(tools=TOOLS, tool_choice="any" if round_no == 1 else "auto")
@@ -292,16 +330,27 @@ def _converse(messages: list, es, client, model: str, verbose: bool) -> str:
         for call in calls:
             args = call.function.arguments
             args = json.loads(args) if isinstance(args, str) else dict(args or {})
-            if verbose:
-                print(f"[Mistral -> Elastic] {call.function.name}({json.dumps(args)})")
-            try:
-                result = _run_tool(es, call.function.name, args)
-            except Exception as e:  # report to the model, do not crash the demo
-                result = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
-            if verbose:
-                print(f"[Elastic -> Mistral] {_summary(call.function.name, result)}")
+            key = (call.function.name, json.dumps(args, sort_keys=True))
+            if key in cache:  # identical repeat: reuse, do not hit Elastic again
+                result = cache[key]
+            else:
+                n_calls += 1
+                if verbose:
+                    print(_call_line(call.function.name, args))
+                try:
+                    result = _run_tool(es, call.function.name, args)
+                except Exception as e:  # report to the model, do not crash the demo
+                    result = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+                cache[key] = result
+                if verbose:
+                    print(_result_line(call.function.name, result))
             messages.append({"role": "tool", "name": call.function.name,
                              "content": json.dumps(result, default=str), "tool_call_id": call.id})
+        if n_calls >= MAX_TOOL_CALLS:
+            messages.append({"role": "user", "content": "Answer now, using only the tool results above."})
+            resp = complete(tools=TOOLS, tool_choice="none")
+            msg = resp.choices[0].message
+            break
     else:
         # Used every round on tools; force a final written answer.
         messages.append({"role": "user", "content": "Answer now, using only the tool results above."})
@@ -313,7 +362,7 @@ def _converse(messages: list, es, client, model: str, verbose: bool) -> str:
         c.text for c in (msg.content or []) if type(c).__name__ == "TextChunk")
     messages.append({"role": "assistant", "content": answer})
     if verbose:
-        print(f"[answered by] {state['model']}\n")
+        print()
         print(answer)
     return answer
 
@@ -328,8 +377,6 @@ def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
-    if verbose:
-        print(f"Q: {question}")
     return _converse(messages, es, client, model, verbose)
 
 

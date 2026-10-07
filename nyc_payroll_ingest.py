@@ -25,6 +25,7 @@ MAPPINGS = {
     "properties": {
         "title": {"type": "keyword", "fields": {"text": {"type": "text"}}},
         "agency": {"type": "keyword", "fields": {"text": {"type": "text"}}},
+        "pay_basis": {"type": "keyword"},
         "headcount": {"type": "integer"},
         "avg_base": {"type": "float"},
         "avg_overtime": {"type": "float"},
@@ -36,10 +37,10 @@ MAPPINGS = {
 
 def fetch(year: int) -> list[dict]:
     params = {
-        "$select": "title_description,agency_name,avg(base_salary) as base,"
+        "$select": "title_description,agency_name,pay_basis,avg(base_salary) as base,"
                    "avg(total_ot_paid) as ot,avg(regular_gross_paid) as gross,count(*) as n",
-        "$where": f"fiscal_year={year} AND pay_basis='per Annum'",
-        "$group": "title_description,agency_name",
+        "$where": f"fiscal_year={year}",
+        "$group": "title_description,agency_name,pay_basis",
         "$order": "n DESC",
         "$limit": 50000,
     }
@@ -59,14 +60,16 @@ def to_docs(rows: list[dict], year: int):
     for row in rows:
         title = (row.get("title_description") or "").strip().upper()
         agency = (row.get("agency_name") or "").strip().upper()
+        basis = (row.get("pay_basis") or "").strip()
         if not title:
             continue
         yield {
             "_index": INDEX_PAY,
-            "_id": f"{title}|{agency}",
+            "_id": f"{title}|{agency}|{basis}",
             "_source": {
                 "title": title,
                 "agency": agency,
+                "pay_basis": basis,
                 "headcount": int(float(row.get("n") or 0)),
                 "avg_base": _f(row.get("base")),
                 "avg_overtime": _f(row.get("ot")),
@@ -86,7 +89,10 @@ def load() -> None:
         rows = fetch(year)
     print(f"Fetched {len(rows)} grouped rows for FY{year} in {time.time() - t0:.1f}s")
     es = es_client()
-    if not es.indices.exists(index=INDEX_PAY):
+    if es.indices.exists(index=INDEX_PAY):
+        es.indices.delete(index=INDEX_PAY)
+        print(f"Deleted old {INDEX_PAY}")
+    if True:
         es.indices.create(index=INDEX_PAY, mappings=MAPPINGS)
         print(f"Created index {INDEX_PAY}")
     ok, errors = helpers.bulk(es, to_docs(rows, year), chunk_size=500, raise_on_error=False)
@@ -98,7 +104,8 @@ def load() -> None:
 
 def _empty(title: str) -> dict:
     return {"title": title, "fiscal_year": FISCAL_YEAR, "headcount": 0, "avg_base": 0.0,
-            "avg_overtime": 0.0, "avg_gross": 0.0, "agencies": [], "matched_how": "none"}
+            "avg_overtime": 0.0, "avg_gross": 0.0, "agencies": [], "matched_how": "none",
+            "pay_basis": "", "avg_base_note": ""}
 
 
 def _search(es, query: dict, size: int = 500) -> list[dict]:
@@ -131,21 +138,32 @@ def real_pay(es, title: str, agency: str | None = None) -> dict:
     if not docs:
         return _empty(t)
 
-    n = sum(d["headcount"] for d in docs) or 1
+    # Headcount spans every pay basis; dollar averages use only the dominant basis,
+    # because averaging hourly rates with annual salaries is meaningless.
+    by_basis: dict[str, int] = {}
+    for d in docs:
+        by_basis[d.get("pay_basis", "")] = by_basis.get(d.get("pay_basis", ""), 0) + d["headcount"]
+    basis = max(by_basis, key=by_basis.get)
+    pay_docs = [d for d in docs if d.get("pay_basis", "") == basis]
+    n = sum(d["headcount"] for d in pay_docs) or 1
 
     def wavg(field: str) -> float:
-        return round(sum(d[field] * d["headcount"] for d in docs) / n, 2)
+        return round(sum(d[field] * d["headcount"] for d in pay_docs) / n, 2)
 
+    note = {"per Hour": "per hour", "per Day": "per day"}.get(basis, "per year")
     top5 = sorted(docs, key=lambda d: d["headcount"], reverse=True)[:5]
     return {
         "title": t,
         "fiscal_year": docs[0].get("fiscal_year", FISCAL_YEAR),
+        "pay_basis": basis,
+        "avg_base_note": note,
         "headcount": sum(d["headcount"] for d in docs),
         "avg_base": wavg("avg_base"),
         "avg_overtime": wavg("avg_overtime"),
         "avg_gross": wavg("avg_gross"),
         "agencies": [{"agency": d["agency"], "headcount": d["headcount"],
-                      "avg_base": d["avg_base"], "avg_overtime": d["avg_overtime"]} for d in top5],
+                      "avg_base": d["avg_base"], "avg_overtime": d["avg_overtime"],
+                      "pay_basis": d.get("pay_basis", "")} for d in top5],
         "matched_how": matched_how,
     }
 

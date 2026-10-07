@@ -102,25 +102,23 @@ def speak(text: str) -> None:
 
 
 def turn(client: Mistral, question: str) -> None:
-    print(f"\nYou: {question}")
     print("thinking...")
     answer = ask(question)
-    print("\nspeaking...")
     speak(spoken_version(client, answer))
 
 
 def get_question(client: Mistral, use_mic: bool) -> tuple[str | None, bool]:
     """Returns (question, use_mic). use_mic flips off if the mic fails."""
     if use_mic:
-        input("\nPress Enter, then speak... ")
-        print("listening... press Enter when done (stops by itself at 8 s)")
+        input("\nPress Enter to talk ")
+        print("listening... (Enter to stop)")
         path = record()
         if path:
             text = transcribe(client, path)
-            print(f"[heard] {text or '(nothing)'}")
+            print(f"heard: {text or '(nothing)'}")
             return text, True
         if path == "":
-            print("[heard] nothing. Talk a bit longer. If the mic is blocked: "
+            print("heard: nothing. Talk a bit longer. If the mic is blocked: "
                   "System Settings > Privacy & Security > Microphone.")
             return "", True
         print(MIC_HELP)
