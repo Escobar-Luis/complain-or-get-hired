@@ -1,10 +1,14 @@
-"""Mistral agent over NYC city government job postings stored in Elastic.
+"""Complain or Get Hired: a Mistral agent over NYC 311 complaints, city job
+postings and city payroll, all stored in Elastic.
 
-Mistral reads the question, picks which Elastic query to run (search_jobs or
-count_jobs, with filters), reads the results, and writes the answer.
+State a complaint ("rats on my block in Astoria") and Mistral looks up how many
+neighbors complained, who owns it, how the city closes it, the open posting that
+would let you fix it, and what people in that title really earn. Plain job
+questions still work.
 
 Usage:
-    .venv/bin/python nyc_jobs_agent.py "city software jobs paying over 100k"
+    .venv/bin/python nyc_jobs_agent.py "rats on my block in Astoria"   # one answer
+    .venv/bin/python nyc_jobs_agent.py                                 # chat loop
 """
 import json
 import os
@@ -18,12 +22,12 @@ from nyc_jobs_ingest import INDEX, es_client
 
 DEFAULT_MODEL = "mistral-large-4"
 FALLBACK_MODEL = "mistral-small-latest"
-MAX_TOOL_ROUNDS = 4
+MAX_TOOL_ROUNDS = 5
 
 RETURN_FIELDS = [
     "job_id", "business_title", "agency", "salary_range_from", "salary_range_to",
     "salary_frequency", "full_time_part_time_indicator", "career_level",
-    "posting_date", "work_location",
+    "posting_date", "work_location", "civil_service_title",
 ]
 
 
@@ -43,13 +47,22 @@ def _filters(min_salary=None, full_time=None, agency=None, posted_after=None) ->
 
 
 def search_jobs(es, query: str, min_salary: float | None = None, full_time: str | None = None,
-                agency: str | None = None, posted_after: str | None = None, k: int = 8) -> list[dict]:
-    """Semantic search on search_text plus exact filters. Returns trimmed postings."""
+                agency: str | None = None, posted_after: str | None = None,
+                title_contains: str | None = None, k: int = 8) -> list[dict]:
+    """Hybrid search (semantic + keyword on title/description/skills) plus exact filters."""
     k = max(1, min(int(k or 8), 8))
+    filters = _filters(min_salary, full_time, agency, posted_after)
+    if title_contains:
+        filters.append({"match": {"business_title": title_contains}})
     body = {
         "bool": {
-            "must": [{"semantic": {"field": "search_text", "query": query}}],
-            "filter": _filters(min_salary, full_time, agency, posted_after),
+            "should": [
+                {"semantic": {"field": "search_text", "query": query}},
+                {"multi_match": {"query": query,
+                                 "fields": ["business_title^3", "job_description", "preferred_skills"]}},
+            ],
+            "minimum_should_match": 1,
+            "filter": filters,
         }
     }
     resp = es.search(
@@ -60,10 +73,28 @@ def search_jobs(es, query: str, min_salary: float | None = None, full_time: str 
     for h in resp["hits"]["hits"]:
         s = h["_source"]
         d = {f: s.get(f) for f in RETURN_FIELDS}
-        d["snippet"] = (s.get("job_description") or "")[:400]
+        d["snippet"] = (s.get("job_description") or "")[:600]
         d["how_to_apply"] = (s.get("to_apply") or "")[:300]
         out.append(d)
     return out
+
+
+def complaints_lookup(es, text: str, borough: str | None = None) -> dict:
+    """311 complaints in the last 30 days, via nyc_311_ingest (loaded lazily)."""
+    try:
+        from nyc_311_ingest import complaints_lookup as _lookup
+    except ImportError:
+        return {"error": "311 data not loaded yet"}
+    return _lookup(es, text, borough)
+
+
+def real_pay(es, title: str, agency: str | None = None) -> dict:
+    """What people in a civil service title really earn, via nyc_payroll_ingest (loaded lazily)."""
+    try:
+        from nyc_payroll_ingest import real_pay as _pay
+    except ImportError:
+        return {"error": "payroll data not loaded yet"}
+    return _pay(es, title, agency)
 
 
 def count_jobs(es, query: str | None = None, min_salary=None, full_time=None) -> dict:
@@ -91,33 +122,52 @@ def count_jobs(es, query: str | None = None, min_salary=None, full_time=None) ->
 
 # ---------------------------------------------------------------- Mistral side
 
-SYSTEM_PROMPT = """You are an assistant over NYC city government job postings (the Jobs NYC Postings dataset) stored in Elasticsearch.
-Rules:
+SYSTEM_PROMPT = """You are "Complain or Get Hired", an assistant over three NYC datasets in Elasticsearch: 311 complaints from the last 30 days, open city job postings (Jobs NYC), and city payroll (what people in each civil service title really earn).
+Tagline: stop complaining, start fixing.
+
+General rules:
 - Always call a tool before answering. Never answer from memory.
-- Use search_jobs to find specific postings by meaning. Use count_jobs for "how many" and "which agencies" questions.
+- Never invent a posting, count, agency, salary or pay figure. Only use what the tools returned. If a tool returned nothing or an error, say so plainly.
+- Plain English. No markdown tables. Keep it short.
+
+A) When the user describes a problem in the city (rats, noise, potholes, a broken streetlight, heat, trash...), follow this order:
+  1. complaints_lookup(text, borough if they named a place; map neighborhoods to their borough, e.g. Astoria -> QUEENS). Call it once; never repeat a tool call with the same arguments.
+  2. search_jobs with agency = the lookup's jobs_agency (exact string) and a query describing the work that fixes the complaint (e.g. "pest control inspector rodent exterminator"). If that returns zero postings, call search_jobs again with no agency filter.
+  3. real_pay with the chosen posting's civil_service_title (and its agency).
+  4. Answer with these sections, each a short line or two, in this order, each heading in bold:
+     **Your complaint** - complaint type, how many neighbors complained in the last 30 days, where (borough counts).
+     **Who owns it** - the agency.
+     **How the city closes it today** - quote one resolution text, shortened.
+     **The job that fixes it** - business title, agency, posting salary range with its frequency, one short how-to-apply hint.
+     **Real pay in that title** - headcount, average base, average overtime, fiscal year. If real_pay matched a different title than you asked for, say there is no payroll match for that title and do not quote the other title's numbers.
+     **Your first month on the job (drafted from the posting)** - exactly three short bullets of work tasks, drawn only from the posting's duties text and the resolution texts. No application steps, no other claims.
+     **Stop complaining, start fixing.**
+  For follow-ups (e.g. "what about in Brooklyn?"), reuse the earlier complaint and rerun the tools for the new place.
+
+B) For ordinary job questions, behave as a job search assistant:
+- Use search_jobs to find postings by meaning; count_jobs for "how many" and "which agencies" questions.
 - Put hard requirements (minimum pay, full-time/part-time, agency, date) into the tool filters, not only the query text.
-- For each job you mention, cite: business title, agency, and salary range with its frequency (Annual, Hourly or Daily).
-- Never invent a posting, salary, or agency. Only use what the tools returned. If nothing fits, say so plainly.
-- Do not add claims about typical pay, schedules, or benefits unless a returned posting says so.
-- Say counts plainly, as numbers.
-- If the data cannot answer part of the question (for example, end time of a shift), say that part is not in the data.
-- Make at most 3 tool calls in total, then answer. Prefer one well-filtered call.
-- Keep the answer short: a short list of jobs or numbers, then one line of advice at most."""
+- For each job, cite business title, agency, and salary range with its frequency (Annual, Hourly or Daily).
+- If the data cannot answer part of the question, say that part is not in the data.
+- Answer with a short list of jobs or numbers, then one line of advice at most.
+
+Make at most 5 tool calls in total, then answer."""
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_jobs",
-            "description": "Semantic search over NYC city job postings in Elasticsearch, with optional exact filters. Returns up to k postings with title, agency, salary, and a snippet.",
+            "description": "Hybrid (semantic + keyword) search over NYC city job postings, with optional exact filters. Returns up to k postings with title, civil_service_title, agency, salary, duties snippet and how to apply.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "What the job is about, in plain words, e.g. 'python backend developer' or 'teaching dance to kids'."},
                     "min_salary": {"type": "number", "description": "Minimum top-of-range salary, in the posting's own units (annual dollars for Annual postings)."},
                     "full_time": {"type": "string", "enum": ["F", "P"], "description": "F for full-time, P for part-time."},
-                    "agency": {"type": "string", "description": "Exact agency name in upper case, e.g. 'DEPT OF ENVIRONMENT PROTECTION'. Only use a name seen in earlier results."},
+                    "agency": {"type": "string", "description": "Exact agency name in upper case, e.g. 'DEPT OF HEALTH/MENTAL HYGIENE'. Use jobs_agency from complaints_lookup, or a name seen in earlier results."},
                     "posted_after": {"type": "string", "description": "ISO date, e.g. '2025-01-01'."},
+                    "title_contains": {"type": "string", "description": "Optional words that must appear in the job title."},
                     "k": {"type": "integer", "description": "Number of postings to return, 1 to 8.", "minimum": 1, "maximum": 8},
                 },
                 "required": ["query"],
@@ -139,6 +189,36 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "complaints_lookup",
+            "description": "Look up NYC 311 complaints from the last 30 days matching a described problem. Returns complaint_type, owning agency, jobs_agency (exact agency name for search_jobs), count_30d, counts by borough, and top resolution texts (how the city closed them).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The problem in plain words, e.g. 'rats on my block'."},
+                    "borough": {"type": "string", "enum": ["MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND"], "description": "Optional borough to focus on."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "real_pay",
+            "description": "What people already in a NYC civil service title really earn, from city payroll: headcount, average base salary, average overtime, average gross.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Civil service title from a posting, e.g. 'PUBLIC HEALTH SANITARIAN'."},
+                    "agency": {"type": "string", "description": "Optional agency name to narrow the match."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
 ]
 
 
@@ -152,6 +232,10 @@ def _run_tool(es, name: str, args: dict):
         return search_jobs(es, **args)
     if name == "count_jobs":
         return count_jobs(es, **args)
+    if name == "complaints_lookup":
+        return complaints_lookup(es, **args)
+    if name == "real_pay":
+        return real_pay(es, **args)
     return {"error": f"unknown tool {name}"}
 
 
@@ -161,16 +245,22 @@ def _should_fall_back(err: Exception) -> bool:
     return status in (400, 404, 429) or "model" in text or "rate" in text or "capacity" in text
 
 
-def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose: bool = True) -> str:
-    """Ask a plain-English question. Mistral picks the Elastic queries, then answers."""
-    if not question or not question.strip():
-        return "Type a question inside ask(\"...\")."
-    es = es or es_client()
-    client = client or _client()
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+def _summary(name: str, result) -> str:
+    if isinstance(result, list):
+        return f"{len(result)} postings"
+    if not isinstance(result, dict):
+        return str(result)[:80]
+    if "error" in result:
+        return f"error: {result['error']}"
+    if name == "complaints_lookup":
+        return f"{result.get('complaint_type')}: {result.get('count_30d')} complaints, agency {result.get('agency')}"
+    if name == "real_pay":
+        return f"{result.get('title')}: headcount {result.get('headcount')}, avg base {result.get('avg_base')}"
+    return str(result.get("total", ""))
+
+
+def _converse(messages: list, es, client, model: str, verbose: bool) -> str:
+    """Run the tool loop on an existing message list (mutated in place). Returns the answer."""
     state = {"model": model, "fell_back": False}
 
     def _chat(**kw):
@@ -189,7 +279,7 @@ def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose
             return _chat(**kw)
 
     if verbose:
-        print(f"Q: {question}\n[model] {model}")
+        print(f"[model] {model}")
 
     for round_no in range(1, MAX_TOOL_ROUNDS + 1):
         # First round must use a tool; later rounds may answer.
@@ -209,8 +299,7 @@ def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose
             except Exception as e:  # report to the model, do not crash the demo
                 result = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
             if verbose:
-                n = len(result) if isinstance(result, list) else result.get("total", result.get("error"))
-                print(f"[Elastic -> Mistral] {n} {'postings' if isinstance(result, list) else ''}".rstrip())
+                print(f"[Elastic -> Mistral] {_summary(call.function.name, result)}")
             messages.append({"role": "tool", "name": call.function.name,
                              "content": json.dumps(result, default=str), "tool_call_id": call.id})
     else:
@@ -222,12 +311,56 @@ def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose
     # Keep only the visible text; drop any reasoning (ThinkChunk) parts.
     answer = msg.content if isinstance(msg.content, str) else "".join(
         c.text for c in (msg.content or []) if type(c).__name__ == "TextChunk")
+    messages.append({"role": "assistant", "content": answer})
     if verbose:
         print(f"[answered by] {state['model']}\n")
         print(answer)
     return answer
 
 
+def ask(question: str, es=None, client=None, model: str = DEFAULT_MODEL, verbose: bool = True) -> str:
+    """Ask a plain-English question or state a complaint. Mistral picks the Elastic queries, then answers."""
+    if not question or not question.strip():
+        return "Type a question inside ask(\"...\")."
+    es = es or es_client()
+    client = client or _client()
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    if verbose:
+        print(f"Q: {question}")
+    return _converse(messages, es, client, model, verbose)
+
+
+def chat(es=None, client=None, model: str = DEFAULT_MODEL, verbose: bool = True) -> None:
+    """Chat loop that keeps history across turns. Type quit to exit."""
+    es = es or es_client()
+    client = client or _client()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    print("Complain or Get Hired. Tell me what is wrong on your block, or ask about city jobs. Type quit to exit.")
+    while True:
+        try:
+            q = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not q:
+            continue
+        if q.lower() in ("quit", "exit", "q"):
+            break
+        mark = len(messages)
+        messages.append({"role": "user", "content": q})
+        try:
+            _converse(messages, es, client, model, verbose)
+        except Exception as e:  # keep the loop alive during the demo
+            print(f"[error] {type(e).__name__}: {str(e)[:300]}")
+            del messages[mark:]  # drop the failed turn so history stays valid
+        print()
+
+
 if __name__ == "__main__":
-    q = " ".join(sys.argv[1:]) or "city software jobs paying over 100k"
-    ask(q)
+    if len(sys.argv) > 1:
+        ask(" ".join(sys.argv[1:]))
+    else:
+        chat()
