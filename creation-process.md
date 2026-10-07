@@ -1,32 +1,60 @@
-# Creation process
+# Creation process: Complain or Get Hired
 
 ```mermaid
 flowchart LR
   H[Human] -- "question" --> P["Python (notebook)"]
+  H -. "spoken complaint" .-> V["Voxtral (Mistral speech-to-text)"]
+  V -. "text" .-> P
   D[NYC Open Data] -- "job postings" --> P
+  C["NYC 311 (317k complaints, 30 days)"] -.-> P
+  PAY["Citywide Payroll (FY2025)"] -.-> P
   P -- "question, then results" --> M["Mistral agent"]
   M -- "tool call (asks Python)" --> P
   P -- "runs search_jobs, count_jobs" --> ES
   ES -- "matching jobs" --> P
+  P -. "loads complaints" .-> I311
+  P -. "loads pay" .-> IPAY
   M -- "answer on screen" --> H
+  P -. "spoken answer" .-> S["Mac speaker"]
   subgraph elastic["inside Elastic"]
     ES[("Elasticsearch (nyc_jobs index)")] -- "text to numbers" --> EMB["Mistral embeddings: numbers that capture meaning"]
+    I311[("Elasticsearch (nyc_311_30d index)")]
+    IPAY[("Elasticsearch (nyc_payroll_fy2025 index)")]
   end
+  classDef planned stroke-dasharray: 5 5
+  class V,C,PAY,I311,IPAY,S planned
 ```
 
 Solid: works today. Dashed: planned.
 
 ## Goal
 
-1. Ask city job questions, get answers.
-2. Elastic (search database) finds matching jobs.
-3. Mistral (AI via Python) explains matches.
+1. Tell what's wrong on your block.
+2. Agent counts agreeing neighbors, names agency.
+3. Finds the city job fixing it.
+4. Shows posting pay versus real pay.
+5. Drafts your first month working there.
+6. Stop complaining; start fixing it yourself.
+
+## Stages, each one demoable
+
+- [x] Stage 0: jobs agent works, pushed.
+  `.venv/bin/python nyc_jobs_agent.py "city software jobs over 100k"`
+- [ ] Stage 1: 311 and payroll loaded.
+  `.venv/bin/python nyc_311_ingest.py --check "Rodent"`
+  `.venv/bin/python nyc_payroll_ingest.py --check "TEACHER"`
+- [ ] Stage 2: agent joins three datasets.
+  `.venv/bin/python nyc_jobs_agent.py "rats on my block in Astoria"`
+- [ ] Stage 3: voice in, voice out.
+  `.venv/bin/python nyc_jobs_voice.py`
+
+1. Each stage: Luis drives, then commit.
 
 ## Where we are
 
 `Human -> Python -> Mistral -> Elastic -> Mistral -> screen`
 
-1. Working: whole loop, question to answer.
+1. Working: jobs; complaints, pay, voice building.
 
 ## Log
 
@@ -46,6 +74,9 @@ Solid: works today. Dashed: planned.
 12. Lesson: reasoning_effort none makes answers faster.
 13. Ran nyc_jobs_matcher.ipynb; the whole demo works.
 14. Wrote quiz_01_foundations.ipynb; quiz teaches the basics.
+15. Pivot: neighborhood complaints become job leads.
+16. Moved repo to Escobar-Luis/complain-or-get-hired on GitHub.
+17. Stage 0 committed; four workers building.
 
 ## Demo, 3 minutes
 
